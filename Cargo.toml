@@ -1,0 +1,13 @@
+[package]
+name = "vault"
+version = "0.1.0"
+edition = "2024"
+
+
+[dependencies]
+borsh = "0.10.3"
+solana-program = "1.18.26"
+spl-token = "4.0.3"
+
+[lib]
+crate-type = ["cdylib", "lib"]

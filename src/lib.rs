@@ -1,0 +1,496 @@
+use solana_program::{
+    account_info::{next_account_info, AccountInfo},
+    entrypoint::ProgramResult,
+    program::{invoke, invoke_signed},
+    program_error::ProgramError,
+    program_pack::Pack,
+    pubkey::Pubkey,
+    system_instruction,
+    system_program,
+    sysvar::{rent::Rent, Sysvar},
+};
+
+use spl_token::id;
+use spl_token::state::{Account as TokenAccount, Mint as MintAccount};
+
+use borsh::{BorshDeserialize, BorshSerialize};
+
+solana_program::entrypoint!(process_instruction);
+
+pub fn process_instruction(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    let instructions = instructionsTypes::try_from_slice(&instruction_data)
+        .map_err(|_| ProgramError::InvalidInstructionData)?;
+
+    match instructions {
+        instructionsTypes::CreateLiquiditypool => createpool(program_id, accounts),
+        instructionsTypes::AddLiquidity { meme, sol } => {
+            addliquidity(program_id, accounts, meme, sol)
+        }
+        instructionsTypes::Swap {
+            amount_in,
+            amount_out,
+            direction,
+        } => swap(program_id, accounts, amount_in, amount_out, direction),
+    }
+}
+
+fn createpool(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+
+    let vault_meme = next_account_info(accounts_iter)?;
+    let vault_solana = next_account_info(accounts_iter)?;
+    let pool_state = next_account_info(accounts_iter)?;
+    let authority = next_account_info(accounts_iter)?;
+    let meme_mint = next_account_info(accounts_iter)?;
+    let system = next_account_info(accounts_iter)?;
+    let token = next_account_info(accounts_iter)?;
+
+    // --- signer / writability checks ---
+    if !authority.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if !authority.is_writable || !pool_state.is_writable || !vault_meme.is_writable || !vault_solana.is_writable {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    // --- program id checks (make sure the caller passed the real programs, not lookalikes) ---
+    if *system.key != system_program::id() {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if *token.key != id() {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    // --- mint sanity check: meme_mint must actually be an initialized SPL mint owned by the token program ---
+    if meme_mint.owner != token.key {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let mint_data = MintAccount::unpack(&meme_mint.data.borrow())
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+    if !mint_data.is_initialized {
+        return Err(ProgramError::UninitializedAccount);
+    }
+
+    let (pda_meme, bump1) = Pubkey::find_program_address(&[b"pda", pool_state.key.as_ref()], program_id);
+    let (pda_sol, bump2) = Pubkey::find_program_address(&[b"solana", meme_mint.key.as_ref()], program_id);
+    let (pda_state, bump3) = Pubkey::find_program_address(&[b"state", meme_mint.key.as_ref()], program_id);
+
+    const FEE: u16 = 3;
+
+    if *vault_meme.key != pda_meme {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if *vault_solana.key != pda_sol {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if *pool_state.key != pda_state {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    // --- prevent re-initialization of an existing pool (someone calling CreateLiquiditypool twice
+    // on the same mint to reset/hijack pool state) ---
+    if pool_state.lamports() > 0 || !pool_state.data_is_empty() {
+        return Err(ProgramError::AccountAlreadyInitialized);
+    }
+    if vault_meme.lamports() > 0 || !vault_meme.data_is_empty() {
+        return Err(ProgramError::AccountAlreadyInitialized);
+    }
+    if vault_solana.lamports() > 0 || !vault_solana.data_is_empty() {
+        return Err(ProgramError::AccountAlreadyInitialized);
+    }
+
+    const SPACE: usize = 130;
+    let rent = Rent::get()?;
+    let lamports = rent.minimum_balance(SPACE);
+
+    let transaction = system_instruction::create_account(
+        authority.key,
+        pool_state.key,
+        lamports,
+        SPACE as u64,
+        program_id,
+    );
+
+    invoke_signed(
+        &transaction,
+        &[pool_state.clone(), authority.clone(), system.clone()],
+        &[&[b"state", meme_mint.key.as_ref(), &[bump3]]],
+    )?;
+
+    let data = poolState {
+        vault_meme: *vault_meme.key,
+        vault_solana: *vault_solana.key,
+        mint_meme: *meme_mint.key,
+        authority: *authority.key,
+        fee: FEE,
+    };
+
+    let mut poolstatedata = pool_state.data.borrow_mut();
+    data.serialize(&mut &mut poolstatedata[..])?;
+    drop(poolstatedata);
+
+    let token_account_space = 165;
+    let token_account_lamports = rent.minimum_balance(token_account_space);
+
+    let ata_ix = system_instruction::create_account(
+        authority.key,
+        vault_meme.key,
+        token_account_lamports,
+        token_account_space as u64,
+        token.key,
+    );
+
+    invoke_signed(
+        &ata_ix,
+        &[authority.clone(), vault_meme.clone(), system.clone()],
+        &[&[b"pda", pool_state.key.as_ref(), &[bump1]]],
+    )?;
+
+    let initialize_ix = spl_token::instruction::initialize_account(
+        token.key,
+        vault_meme.key,
+        meme_mint.key,
+        pool_state.key,
+    )?;
+    invoke(
+        &initialize_ix,
+        &[
+            vault_meme.clone(),
+            meme_mint.clone(),
+            pool_state.clone(),
+            token.clone(),
+        ],
+    )?;
+
+    let sol_space = 0;
+    let sol_lamports = rent.minimum_balance(sol_space);
+
+    let sol_ix = system_instruction::create_account(
+        authority.key,
+        vault_solana.key,
+        sol_lamports,
+        sol_space as u64,
+        pool_state.key,
+    );
+
+    invoke_signed(
+        &sol_ix,
+        &[authority.clone(), vault_solana.clone(), system.clone()],
+        &[&[b"solana", meme_mint.key.as_ref(), &[bump2]]],
+    )?;
+
+    Ok(())
+}
+
+fn addliquidity(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64, sol: u64) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+
+    let vault_meme = next_account_info(accounts_iter)?;
+    let vault_solana = next_account_info(accounts_iter)?;
+    let pool_state = next_account_info(accounts_iter)?;
+    let user = next_account_info(accounts_iter)?;
+    let user_meme = next_account_info(accounts_iter)?;
+    let meme_mint = next_account_info(accounts_iter)?;
+    let system = next_account_info(accounts_iter)?;
+    let token = next_account_info(accounts_iter)?;
+
+    if !user.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if !vault_meme.is_writable || !vault_solana.is_writable || !user.is_writable || !user_meme.is_writable {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    // --- reject zero-amount / no-op calls up front ---
+    if amount == 0 || sol == 0 {
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    if *system.key != system_program::id() {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if *token.key != id() {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    let (pda_meme, _bump1) = Pubkey::find_program_address(&[b"pda", pool_state.key.as_ref()], program_id);
+    let (pda_sol, _bump2) = Pubkey::find_program_address(&[b"solana", meme_mint.key.as_ref()], program_id);
+    let (pda_state, _bump3) = Pubkey::find_program_address(&[b"state", meme_mint.key.as_ref()], program_id);
+
+    if *vault_meme.key != pda_meme {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if *vault_solana.key != pda_sol {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if *pool_state.key != pda_state {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    // --- pool must already exist and its stored vaults must match what was passed in ---
+    if pool_state.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let state_data = poolState::try_from_slice(&pool_state.data.borrow())
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+    if state_data.vault_meme != *vault_meme.key
+        || state_data.vault_solana != *vault_solana.key
+        || state_data.mint_meme != *meme_mint.key
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    // --- user's token account must actually be owned by `user` and hold the pool's meme mint ---
+    if user_meme.owner != token.key {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let user_meme_data = TokenAccount::unpack(&user_meme.data.borrow())
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+    if user_meme_data.owner != *user.key {
+        return Err(ProgramError::IllegalOwner);
+    }
+    if user_meme_data.mint != *meme_mint.key {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if user_meme_data.amount < amount {
+        return Err(ProgramError::InsufficientFunds);
+    }
+    if user.lamports() < sol {
+        return Err(ProgramError::InsufficientFunds);
+    }
+
+    let meme_add = spl_token::instruction::transfer(
+        token.key,
+        user_meme.key,
+        vault_meme.key,
+        user.key,
+        &[],
+        amount,
+    )?;
+
+    let sol_add = system_instruction::transfer(user.key, vault_solana.key, sol);
+
+    invoke(
+        &meme_add,
+        &[
+            user_meme.clone(),
+            vault_meme.clone(),
+            user.clone(),
+            token.clone(),
+        ],
+    )?;
+
+    invoke(&sol_add, &[user.clone(), vault_solana.clone(), system.clone()])?;
+
+    Ok(())
+}
+
+fn swap(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    amount_in: u64,
+    amount_out: u64,
+    direction: Swapdirection,
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+
+    let vault_meme = next_account_info(accounts_iter)?;
+    let vault_solana = next_account_info(accounts_iter)?;
+    let pool_state = next_account_info(accounts_iter)?;
+    let user = next_account_info(accounts_iter)?;
+    let user_meme = next_account_info(accounts_iter)?;
+    let meme_mint = next_account_info(accounts_iter)?;
+    let system = next_account_info(accounts_iter)?;
+    let token = next_account_info(accounts_iter)?;
+
+    if !user.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if !vault_meme.is_writable || !vault_solana.is_writable || !user.is_writable || !user_meme.is_writable {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    // --- reject zero / no-op swaps ---
+    if amount_in == 0 || amount_out == 0 {
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    if *system.key != system_program::id() {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if *token.key != id() {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    let (pda_meme, bump1) = Pubkey::find_program_address(&[b"pda", pool_state.key.as_ref()], program_id);
+    let (pda_sol, bump2) = Pubkey::find_program_address(&[b"solana", meme_mint.key.as_ref()], program_id);
+    let (pda_state, bump3) = Pubkey::find_program_address(&[b"state", meme_mint.key.as_ref()], program_id);
+
+    if *vault_meme.key != pda_meme {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if *vault_solana.key != pda_sol {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if *pool_state.key != pda_state {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    // --- pool must exist and match the vaults/mint passed in ---
+    if pool_state.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let state_data = poolState::try_from_slice(&pool_state.data.borrow())
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+    if state_data.vault_meme != *vault_meme.key
+        || state_data.vault_solana != *vault_solana.key
+        || state_data.mint_meme != *meme_mint.key
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    // --- user's meme token account ownership / mint check ---
+    if user_meme.owner != token.key {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let user_meme_data = TokenAccount::unpack(&user_meme.data.borrow())
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+    if user_meme_data.owner != *user.key {
+        return Err(ProgramError::IllegalOwner);
+    }
+    if user_meme_data.mint != *meme_mint.key {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    // ***********************************************************************************
+    // IMPORTANT — READ THIS ONE:
+    // amount_out is currently supplied entirely by the caller. Until you implement the
+    // x*y=k pricing formula and compute amount_out yourself (or at minimum enforce a
+    // slippage bound against an on-chain-computed price), this instruction lets anyone
+    // request an arbitrary amount_out and drain a vault in a single call. The checks
+    // below stop it from panicking / from paying out more than the vault holds, but
+    // that is NOT the same as correct pricing. Do not point this at real funds until
+    // amount_out is derived from pool reserves on-chain.
+    // ***********************************************************************************
+
+    match direction {
+        Swapdirection::Memetosol => {
+            if user_meme_data.amount < amount_in {
+                return Err(ProgramError::InsufficientFunds);
+            }
+            if vault_solana.lamports() < amount_out {
+                return Err(ProgramError::InsufficientFunds);
+            }
+
+            let transactionmts = spl_token::instruction::transfer(
+                token.key,
+                user_meme.key,
+                vault_meme.key,
+                user.key,
+                &[],
+                amount_in,
+            )?;
+
+            invoke(
+                &transactionmts,
+                &[
+                    token.clone(),
+                    user_meme.clone(),
+                    user.clone(),
+                    vault_meme.clone(),
+                ],
+            )?;
+
+            let ix_solback = system_instruction::transfer(vault_solana.key, user.key, amount_out);
+
+            // FIX: vault_solana was derived with seed b"solana" + bump2, not bump3
+            // (bump3 belongs to pool_state's b"state" seed). Signing with the wrong
+            // bump here derives a different address than vault_solana.key, so
+            // invoke_signed would never actually grant signer authority to the
+            // right account and this transfer would fail.
+            invoke_signed(
+                &ix_solback,
+                &[user.clone(), vault_solana.clone(), system.clone()],
+                &[&[b"solana", meme_mint.key.as_ref(), &[bump2]]],
+            )?;
+        }
+        Swapdirection::Soltomeme => {
+            if user.lamports() < amount_in {
+                return Err(ProgramError::InsufficientFunds);
+            }
+
+            let vault_meme_data = TokenAccount::unpack(&vault_meme.data.borrow())
+                .map_err(|_| ProgramError::InvalidAccountData)?;
+            if vault_meme_data.amount < amount_out {
+                return Err(ProgramError::InsufficientFunds);
+            }
+
+            let transactionstm = system_instruction::transfer(user.key, vault_solana.key, amount_in);
+            invoke(
+                &transactionstm,
+                &[user.clone(), vault_solana.clone(), system.clone()],
+            )?;
+
+            let ix_memeback = spl_token::instruction::transfer(
+                token.key,
+                vault_meme.key,
+                user_meme.key,
+                pool_state.key,
+                &[],
+                amount_out,
+            )?;
+
+            // FIX: the transfer authority for vault_meme is pool_state (that's what
+            // it was initialized with in createpool), not vault_meme's own PDA.
+            // Signing with seed b"pda" + bump1 derives vault_meme's own address, which
+            // is not the signer this instruction needs — it needs pool_state's seeds
+            // (b"state" + bump3). The original code would not have actually authorized
+            // this transfer.
+            invoke_signed(
+                &ix_memeback,
+                &[
+                    token.clone(),
+                    vault_meme.clone(),
+                    user_meme.clone(),
+                    pool_state.clone(),
+                ],
+                &[&[b"state", meme_mint.key.as_ref(), &[bump3]]],
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, BorshDeserialize, BorshSerialize)]
+pub enum instructionsTypes {
+    CreateLiquiditypool,
+    Swap {
+        amount_in: u64,
+        amount_out: u64,
+        direction: Swapdirection,
+    },
+    AddLiquidity {
+        meme: u64,
+        sol: u64,
+    },
+}
+
+#[derive(Debug, BorshDeserialize, BorshSerialize)]
+pub enum Swapdirection {
+    Memetosol,
+    Soltomeme,
+}
+
+#[derive(Debug, BorshDeserialize, BorshSerialize)]
+pub struct poolState {
+    vault_meme: Pubkey,
+    vault_solana: Pubkey,
+    mint_meme: Pubkey,
+    authority: Pubkey,
+    fee: u16,
+}
