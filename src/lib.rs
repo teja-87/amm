@@ -1,13 +1,5 @@
 use solana_program::{
-    account_info::{next_account_info, AccountInfo},
-    entrypoint::ProgramResult,
-    program::{invoke, invoke_signed},
-    program_error::ProgramError,
-    program_pack::Pack,
-    pubkey::Pubkey,
-    system_instruction,
-    system_program,
-    sysvar::{rent::Rent, Sysvar},
+    account_info::{AccountInfo, next_account_info}, entrypoint::ProgramResult, instruction::InstructionError::ArithmeticOverflow, program::{invoke, invoke_signed}, program_error::ProgramError, program_pack::Pack, pubkey::Pubkey, system_instruction, system_program, sysvar::{Sysvar, rent::Rent},
 };
 
 use spl_token::id;
@@ -202,7 +194,6 @@ fn addliquidity(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64, sol:
         return Err(ProgramError::InvalidAccountData);
     }
 
-    // --- reject zero-amount / no-op calls up front ---
     if amount == 0 || sol == 0 {
         return Err(ProgramError::InvalidArgument);
     }
@@ -310,7 +301,7 @@ fn swap(
         return Err(ProgramError::InvalidAccountData);
     }
 
-    // --- reject zero / no-op swaps ---
+   
     if amount_in == 0 || amount_out == 0 {
         return Err(ProgramError::InvalidArgument);
     }
@@ -379,18 +370,16 @@ fn swap(
             }
             if vault_solana.lamports() < amount_out {
                 return Err(ProgramError::InsufficientFunds);
-            }
-
-            
+            }           
 
 
 
             let present_meme =x;
             let present_solana=vault_solana.lamports();
 
-            let k=present_meme*present_solana;
+            let k=present_meme.checked_mul(present_solana).ok_or(ProgramError::ArithmeticOverflow)?;
 
-            let new_meme=present_meme+amount_in ;
+            let new_meme=present_meme.checked_add(amount_in).ok_or(ProgramError::ArithmeticOverflow)?;
 
 
 
@@ -417,9 +406,9 @@ fn swap(
             )?;
 
 
-            let new_solana=k/new_meme;
+            let new_solana=k.checked_div(new_meme).ok_or(ProgramError::ArithmeticOverflow)?;
 
-            let actual_amount_out = present_solana - new_solana;
+            let actual_amount_out = present_solana.checked_sub(new_solana).ok_or(ProgramError::ArithmeticOverflow)?;
 
             if actual_amount_out<amount_out{
                 return Err(ProgramError::InsufficientFunds);
@@ -448,13 +437,13 @@ fn swap(
             let present_meme=vault_meme_data.amount;
             let y=**vault_solana.lamports.borrow();
 
-            let k = y * present_meme;
+            let k = y.checked_mul(present_meme).ok_or(ProgramError::ArithmeticOverflow)?;
 
-            let new_sol = y + amount_in;
+            let new_sol = y.checked_add(amount_in).ok_or(ProgramError::ArithmeticOverflow)?;
 
-            let new_meme = k / new_sol;
+            let new_meme = k.checked_div( new_sol).ok_or(ProgramError::ArithmeticOverflow)?;
 
-            let actual_meme_out = present_meme - new_meme;
+            let actual_meme_out = present_meme.checked_sub( new_meme).ok_or(ProgramError::ArithmeticOverflow)?;
 
 
             let transactionstm = system_instruction::transfer(user.key, vault_solana.key, amount_in);
