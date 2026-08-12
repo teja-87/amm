@@ -56,8 +56,6 @@ fn createpool(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     if !authority.is_writable || !pool_state.is_writable || !vault_meme.is_writable || !vault_solana.is_writable {
         return Err(ProgramError::InvalidAccountData);
     }
-
-    // --- program id checks (make sure the caller passed the real programs, not lookalikes) ---
     if *system.key != system_program::id() {
         return Err(ProgramError::IncorrectProgramId);
     }
@@ -65,7 +63,7 @@ fn createpool(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         return Err(ProgramError::IncorrectProgramId);
     }
 
-    // --- mint sanity check: meme_mint must actually be an initialized SPL mint owned by the token program ---
+    
     if meme_mint.owner != token.key {
         return Err(ProgramError::IllegalOwner);
     }
@@ -91,8 +89,7 @@ fn createpool(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         return Err(ProgramError::InvalidSeeds);
     }
 
-    // --- prevent re-initialization of an existing pool (someone calling CreateLiquiditypool twice
-    // on the same mint to reset/hijack pool state) ---
+   
     if pool_state.lamports() > 0 || !pool_state.data_is_empty() {
         return Err(ProgramError::AccountAlreadyInitialized);
     }
@@ -231,7 +228,7 @@ fn addliquidity(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64, sol:
         return Err(ProgramError::InvalidSeeds);
     }
 
-    // --- pool must already exist and its stored vaults must match what was passed in ---
+    
     if pool_state.owner != program_id {
         return Err(ProgramError::IllegalOwner);
     }
@@ -244,7 +241,6 @@ fn addliquidity(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64, sol:
         return Err(ProgramError::InvalidAccountData);
     }
 
-    // --- user's token account must actually be owned by `user` and hold the pool's meme mint ---
     if user_meme.owner != token.key {
         return Err(ProgramError::IllegalOwner);
     }
@@ -340,7 +336,7 @@ fn swap(
         return Err(ProgramError::InvalidSeeds);
     }
 
-    // --- pool must exist and match the vaults/mint passed in ---
+  
     if pool_state.owner != program_id {
         return Err(ProgramError::IllegalOwner);
     }
@@ -353,7 +349,6 @@ fn swap(
         return Err(ProgramError::InvalidAccountData);
     }
 
-    // --- user's meme token account ownership / mint check ---
     if user_meme.owner != token.key {
         return Err(ProgramError::IllegalOwner);
     }
@@ -366,16 +361,16 @@ fn swap(
         return Err(ProgramError::InvalidAccountData);
     }
 
-    // ***********************************************************************************
-    // IMPORTANT — READ THIS ONE:
-    // amount_out is currently supplied entirely by the caller. Until you implement the
-    // x*y=k pricing formula and compute amount_out yourself (or at minimum enforce a
-    // slippage bound against an on-chain-computed price), this instruction lets anyone
-    // request an arbitrary amount_out and drain a vault in a single call. The checks
-    // below stop it from panicking / from paying out more than the vault holds, but
-    // that is NOT the same as correct pricing. Do not point this at real funds until
-    // amount_out is derived from pool reserves on-chain.
-    // ***********************************************************************************
+    let vault_meme_data=spl_token::state::Account::unpack(&vault_meme.data.borrow())?;  
+
+
+
+    let x =vault_meme_data.amount;
+    let y=**vault_solana.lamports.borrow();
+
+   
+
+ 
 
     match direction {
         Swapdirection::Memetosol => {
@@ -385,6 +380,22 @@ fn swap(
             if vault_solana.lamports() < amount_out {
                 return Err(ProgramError::InsufficientFunds);
             }
+
+            
+
+
+
+            let present_meme =x;
+            let present_solana=vault_solana.lamports();
+
+            let k=present_meme*present_solana;
+
+            let new_meme=present_meme+amount_in ;
+
+
+
+            
+
 
             let transactionmts = spl_token::instruction::transfer(
                 token.key,
@@ -405,13 +416,18 @@ fn swap(
                 ],
             )?;
 
-            let ix_solback = system_instruction::transfer(vault_solana.key, user.key, amount_out);
 
-            // FIX: vault_solana was derived with seed b"solana" + bump2, not bump3
-            // (bump3 belongs to pool_state's b"state" seed). Signing with the wrong
-            // bump here derives a different address than vault_solana.key, so
-            // invoke_signed would never actually grant signer authority to the
-            // right account and this transfer would fail.
+            let new_solana=k/new_meme;
+
+            let actual_amount_out = present_solana - new_solana;
+
+            if actual_amount_out<amount_out{
+                return Err(ProgramError::InsufficientFunds);
+            }
+
+            let ix_solback = system_instruction::transfer(vault_solana.key, user.key, actual_amount_out);
+
+         
             invoke_signed(
                 &ix_solback,
                 &[user.clone(), vault_solana.clone(), system.clone()],
@@ -429,11 +445,30 @@ fn swap(
                 return Err(ProgramError::InsufficientFunds);
             }
 
+            let present_meme=vault_meme_data.amount;
+            let y=**vault_solana.lamports.borrow();
+
+            let k = y * present_meme;
+
+            let new_sol = y + amount_in;
+
+            let new_meme = k / new_sol;
+
+            let actual_meme_out = present_meme - new_meme;
+
+
             let transactionstm = system_instruction::transfer(user.key, vault_solana.key, amount_in);
             invoke(
                 &transactionstm,
                 &[user.clone(), vault_solana.clone(), system.clone()],
             )?;
+
+            
+            if actual_meme_out< amount_out{
+                return Err(ProgramError::InsufficientFunds);
+            }
+
+            
 
             let ix_memeback = spl_token::instruction::transfer(
                 token.key,
@@ -441,15 +476,10 @@ fn swap(
                 user_meme.key,
                 pool_state.key,
                 &[],
-                amount_out,
+                actual_meme_out,
             )?;
 
-            // FIX: the transfer authority for vault_meme is pool_state (that's what
-            // it was initialized with in createpool), not vault_meme's own PDA.
-            // Signing with seed b"pda" + bump1 derives vault_meme's own address, which
-            // is not the signer this instruction needs — it needs pool_state's seeds
-            // (b"state" + bump3). The original code would not have actually authorized
-            // this transfer.
+         
             invoke_signed(
                 &ix_memeback,
                 &[
